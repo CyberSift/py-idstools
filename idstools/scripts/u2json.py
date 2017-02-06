@@ -1,42 +1,19 @@
-# Copyright (c) 2014-2015 Jason Ish
-# All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions
-# are met:
-#
-# 1. Redistributions of source code must retain the above copyright
-#    notice, this list of conditions and the following disclaimer.
-# 2. Redistributions in binary form must reproduce the above copyright
-#    notice, this list of conditions and the following disclaimer in the
-#    documentation and/or other materials provided with the distribution.
-#
-# THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED
-# WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
-# MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT,
-# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
-# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
-# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
-# IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-# POSSIBILITY OF SUCH DAMAGE.
+from __future__ import print_function
 
 """Read unified2 log files and output records as JSON."""
 
-from __future__ import print_function
+
 
 import sys
 import os
 import os.path
 import base64
+from subprocess import check_output
 
 if sys.argv[0] == __file__:
     sys.path.insert(
         0, os.path.abspath(os.path.join(__file__, "..", "..", "..")))
 
-import json
 import logging
 
 try:
@@ -46,9 +23,21 @@ except ImportError as err:
 
 from idstools import unified2
 from idstools import maps
+from elasticsearch import Elasticsearch
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 LOG = logging.getLogger()
+
+es_ip="192.168.10.209"
+
+es = Elasticsearch(host=es_ip, timeout=600)
+
+
+#update elasticsearch
+def create_snort_module_alert(message):
+
+    #print(es.index(index="alerts", pipeline="alerts-geoip-info", doc_type='alert', body=message))
+    print(es.index(index="snort", doc_type='alert', body=message))
 
 class Formatter(object):
 
@@ -90,7 +79,8 @@ class Formatter(object):
                 continue
             else:
                 event[key] = record[key]
-        return {"event": event}
+        timestamp=str(event['event-second'])+'000'
+        return {"timestamp":timestamp, "event": event}
 
     def format_packet(self, record):
         packet = {}
@@ -99,7 +89,9 @@ class Formatter(object):
                 packet[key] = base64.b64encode(record[key]).decode("utf-8")
             else:
                 packet[key] = record[key]
-        return {"packet": packet}
+
+        timestamp = str(packet['event-second'])+'000'
+        return {"timestamp":timestamp, "packet": packet}
 
     def format_extra_data(self, record):
         data = {}
@@ -295,7 +287,8 @@ def main():
         reader = unified2.FileRecordReader(*args.filenames)
     elif args.directory and args.prefix:
         if args.bookmark:
-            bookmark = unified2.Unified2Bookmark(filename=args.bookmark)
+            current_snort_pid = str(check_output(["pgrep", "-u", "snort"])).strip()
+            bookmark = unified2.Unified2Bookmark(filename=args.bookmark+'_'+current_snort_pid)
             init_filename, init_offset = bookmark.get()
         else:
             init_filename = None
@@ -315,19 +308,23 @@ def main():
 
     count = 0
 
+    record = True
+
     try:
-        for record in reader:
-            try:
-                as_json = json.dumps(formatter.format(record), sort_keys=args.sort_keys)
-                for out in outputs:
-                    out.write(as_json)
-                count += 1
-            except Exception as err:
-                LOG.error("Failed to encode record as JSON: %s: %s" % (
-                    str(err), str(record)))
-            if bookmark:
-                filename, offset = reader.tell()
-                bookmark.update(filename, offset)
+        while record is not None:
+            record = reader.next()
+            if record is not None:
+                try:
+                    as_json = formatter.format(record)
+                    if 'event' in as_json:
+                        create_snort_module_alert(as_json)
+                    count += 1
+                except Exception as err:
+                    LOG.error("Failed to encode record as JSON: %s: %s" % (
+                        str(err), str(record)))
+                if bookmark:
+                    filename, offset = reader.tell()
+                    bookmark.update(filename, offset)
     except unified2.UnknownRecordType as err:
         if count == 0:
             LOG.error("%s: Is this a unified2 file?" % (err))
