@@ -1,49 +1,73 @@
-from __future__ import print_function
+# Copyright (c) 2014-2015 Jason Ish
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED
+# WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT,
+# INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+# IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
 
 """Read unified2 log files and output records as JSON."""
 
-
+from __future__ import print_function
 
 import sys
 import os
 import os.path
 import base64
-from subprocess import check_output
+import string
+import json
+import logging
 
 if sys.argv[0] == __file__:
     sys.path.insert(
         0, os.path.abspath(os.path.join(__file__, "..", "..", "..")))
-
-import logging
 
 try:
     import argparse
 except ImportError as err:
     from idstools.compat.argparse import argparse
 
+try:
+    from collections import OrderedDict
+except ImportError as err:
+    from idstools.compat.ordereddict import OrderedDict
+
 from idstools import unified2
 from idstools import maps
-from elasticsearch import Elasticsearch
+from idstools import util
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 LOG = logging.getLogger()
 
-es_ip="192.168.10.209"
-
-es = Elasticsearch(host=es_ip, timeout=600)
-
-
-#update elasticsearch
-def create_snort_module_alert(message):
-
-    #print(es.index(index="alerts", pipeline="alerts-geoip-info", doc_type='alert', body=message))
-    print(es.index(index="snort", doc_type='alert', body=message))
-
 class Formatter(object):
 
-    def __init__(self, msgmap=None, classmap=None):
+    def __init__(self, msgmap=None, classmap=None, packet_printable=False,
+                 packet_hex=False, extra_printable=False):
         self.msgmap = msgmap
         self.classmap = classmap
+        self.packet_printable = packet_printable
+        self.packet_hex = packet_hex
+        self.extra_printable = extra_printable
+
+    def key(self, key):
+        return key
 
     def resolve_msg(self, event, default=None):
         if self.msgmap:
@@ -79,50 +103,70 @@ class Formatter(object):
                 continue
             else:
                 event[key] = record[key]
-        timestamp=str(event['event-second'])+'000'
-        return {"timestamp":timestamp, "event": event}
+        return OrderedDict([("type", "event"), ("event", event)])
 
     def format_packet(self, record):
         packet = {}
         for key in record:
             if key == "data":
-                packet[key] = base64.b64encode(record[key]).decode("utf-8")
+                packet["data"] = base64.b64encode(record[key]).decode("utf-8")
+                if self.packet_printable:
+                    packet["data-printable"] = util.format_printable(
+                        record[key])
+                if self.packet_hex:
+                    packet["data-hex"] = self.format_hex(record[key])
             else:
                 packet[key] = record[key]
+        return OrderedDict([("type", "packet"), ("packet", packet)])
 
-        timestamp = str(packet['event-second'])+'000'
-        return {"timestamp":timestamp, "packet": packet}
+    def format_hex(self, data):
+        if sys.version_info.major < 3:
+            hexbytes = ["%02x" % ord(byte) for byte in data]
+        else:
+            hexbytes = ["%02x" % byte for byte in data]
+        return " ".join(hexbytes)
 
     def format_extra_data(self, record):
         data = {}
 
-        # For data types that can be printed in plain text, extract
-        # the data into its own field with a descriptive name.
-        if record["type"] == unified2.EXTRA_DATA_TYPE["SMTP_FILENAME"]:
-            data["smtp-filename"] = record["data"]
-        elif record["type"] == unified2.EXTRA_DATA_TYPE["SMTP_MAIL_FROM"]:
-            data["smtp-from"] = record["data"]
-        elif record["type"] == unified2.EXTRA_DATA_TYPE["SMTP_RCPT_TO"]:
-            data["smtp-rcpt-to"] = record["data"]
-        elif record["type"] == unified2.EXTRA_DATA_TYPE["SMTP_HEADERS"]:
-            data["smtp-headers"] = record["data"]
-        elif record["type"] == unified2.EXTRA_DATA_TYPE["HTTP_URI"]:
-            data["http-uri"] = record["data"]
-        elif record["type"] == unified2.EXTRA_DATA_TYPE["HTTP_HOSTNAME"]:
-            data["http-hostname"] = record["data"]
-        elif record["type"] == unified2.EXTRA_DATA_TYPE["NORMALIZED_JS"]:
-            data["javascript"] = record["data"]
-        else:
-            LOG.warning("Unknown extra-data record type: %s" % (
-                str(record["type"])))
+        # Remove this, the printable data is accessible as
+        # "data-printable" now.
+        #
+        # # For data types that can be printed in plain text, extract
+        # # the data into its own field with a descriptive name.
+        # if record["type"] == unified2.EXTRA_DATA_TYPE["SMTP_FILENAME"]:
+        #     data["smtp-filename"] = record["data"]
+        # elif record["type"] == unified2.EXTRA_DATA_TYPE["SMTP_MAIL_FROM"]:
+        #     data["smtp-from"] = record["data"]
+        # elif record["type"] == unified2.EXTRA_DATA_TYPE["SMTP_RCPT_TO"]:
+        #     data["smtp-rcpt-to"] = record["data"]
+        # elif record["type"] == unified2.EXTRA_DATA_TYPE["SMTP_HEADERS"]:
+        #     data["smtp-headers"] = record["data"]
+        # elif record["type"] == unified2.EXTRA_DATA_TYPE["HTTP_URI"]:
+        #     data["http-uri"] = record["data"]
+        # elif record["type"] == unified2.EXTRA_DATA_TYPE["HTTP_HOSTNAME"]:
+        #     data["http-hostname"] = record["data"]
+        # elif record["type"] == unified2.EXTRA_DATA_TYPE["NORMALIZED_JS"]:
+        #     data["javascript"] = record["data"]
+        # else:
+        #     LOG.warning("Unknown extra-data record type: %s" % (
+        #         str(record["type"])))
+
+        for key, val in unified2.EXTRA_DATA_TYPE.items():
+            if val == record["type"]:
+                data[self.key("extra-data-type")] = key.lower()
+                break
 
         for key in record:
             if key == "data":
-                data[key] = base64.b64encode(record[key]).decode("utf-8")
+                data["data"] = base64.b64encode(record[key]).decode("utf-8")
+                if self.extra_printable:
+                    data["data-printable"] = util.format_printable(record[key])
             else:
                 data[key] = record[key]
 
-        return {"extra-data": data}
+        return OrderedDict([("type", self.key("extra-data")),
+                            (self.key("extra-data"), data)])
 
     def format(self, record):
         if isinstance(record, unified2.Event):
@@ -142,15 +186,17 @@ class OutputWrapper(object):
         self.fileobj = fileobj
 
         if self.fileobj is None:
-            self.reopen()
             self.isfile = True
+            self.reopen()
         else:
             self.isfile = False
 
     def reopen(self):
+        if not self.isfile:
+            return
         if self.fileobj:
             self.fileobj.close()
-        self.fileobj = open(self.filename, "ab")
+        self.fileobj = open(self.filename, "a")
 
     def write(self, buf):
         if self.isfile:
@@ -236,6 +282,15 @@ def main():
         "--verbose", action="store_true", default=False,
         help="be more verbose")
     parser.add_argument(
+        "--packet-printable", action="store_true", default=False,
+        help="output printable packet data in addition to base64")
+    parser.add_argument(
+        "--packet-hex", action="store_true", default=False,
+        help="output packet data as hex in addition to base64")
+    parser.add_argument(
+        "--extra-printable", action="store_true", default=False,
+        help="output printable extra data in addition to base64")
+    parser.add_argument(
         "filenames", nargs="*")
     args = parser.parse_args()
 
@@ -287,8 +342,7 @@ def main():
         reader = unified2.FileRecordReader(*args.filenames)
     elif args.directory and args.prefix:
         if args.bookmark:
-            current_snort_pid = str(check_output(["pgrep", "-u", "snort"])).strip()
-            bookmark = unified2.Unified2Bookmark(filename=args.bookmark+'_'+current_snort_pid)
+            bookmark = unified2.Unified2Bookmark(filename=args.bookmark)
             init_filename, init_offset = bookmark.get()
         else:
             init_filename = None
@@ -304,27 +358,29 @@ def main():
         LOG.error("No spool or files provided.")
         return 1
 
-    formatter = Formatter(msgmap=msgmap, classmap=classmap)
+    formatter = Formatter(
+        msgmap=msgmap, classmap=classmap,
+        packet_printable=args.packet_printable,
+        packet_hex=args.packet_hex,
+        extra_printable=args.extra_printable)
 
     count = 0
 
-    record = True
-
     try:
-        while record is not None:
-            record = reader.next()
-            if record is not None:
-                try:
-                    as_json = formatter.format(record)
-                    if 'event' in as_json:
-                        create_snort_module_alert(as_json)
-                    count += 1
-                except Exception as err:
-                    LOG.error("Failed to encode record as JSON: %s: %s" % (
-                        str(err), str(record)))
-                if bookmark:
-                    filename, offset = reader.tell()
-                    bookmark.update(filename, offset)
+        for record in reader:
+            try:
+                as_json = json.dumps(
+                    formatter.format(record), sort_keys=args.sort_keys)
+                for out in outputs:
+                    out.write(as_json)
+                count += 1
+            except Exception as err:
+                LOG.error("Failed to encode record as JSON: %s: %s" % (
+                    str(err), str(record)))
+                raise
+            if bookmark:
+                filename, offset = reader.tell()
+                bookmark.update(filename, offset)
     except unified2.UnknownRecordType as err:
         if count == 0:
             LOG.error("%s: Is this a unified2 file?" % (err))
