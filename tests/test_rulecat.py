@@ -25,12 +25,27 @@
 
 from __future__ import print_function
 
+import os
 import unittest
 import shlex
 import re
 
 import idstools.rule
 from idstools.scripts import rulecat
+
+class TestFetch(unittest.TestCase):
+
+    def test_check_checksum(self):
+        """Test that we detect when the checksum are the same. This is mainly
+        to catch issues between Python 2 and 3.
+        """
+        fetch = rulecat.Fetch(None)
+        url = "file://%s/emerging.rules.tar.gz" % (
+            os.path.dirname(os.path.realpath(__file__)))
+        local_file = "%s/emerging.rules.tar.gz" % (
+            os.path.dirname(os.path.realpath(__file__)))
+        r = fetch.check_checksum(local_file, url)
+        self.assertTrue(r)
 
 class ThresholdProcessorTestCase(unittest.TestCase):
 
@@ -102,6 +117,26 @@ class ModifyRuleFilterTestCase(unittest.TestCase):
         self.assertEqual(
             str(rule1),
             """alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"ET MALWARE Windows executable sent when remote host claims to send an image 2"; flow: established,from_server; content:"|ff ff|Content-Type|3a| image/jpeg|0d 0a 0d 0a|MZ"; fast_pattern:12,20; classtype:trojan-activity; sid:2020757; rev:2;)""")
+
+    def test_re_backref_one(self):
+        rule0 = idstools.rule.parse(self.rule_string)
+        line = 're:classtype:trojan-activity "(alert)(.*)" "drop\\2"'
+        filter = rulecat.ModifyRuleFilter.parse(line)
+        self.assertTrue(filter != None)
+        self.assertTrue(filter.match(rule0))
+        rule1 = filter.filter(rule0)
+        expected = """drop http $EXTERNAL_NET any -> $HOME_NET any (msg:"ET MALWARE Windows executable sent when remote host claims to send an image 2"; flow: established,from_server; content:"|0d 0a|Content-Type|3a| image/jpeg|0d 0a 0d 0a|MZ"; fast_pattern:12,20; classtype:trojan-activity; sid:2020757; rev:2;)"""
+        self.assertEqual(str(rule1), expected)
+
+    def test_re_backref_two(self):
+        rule0 = idstools.rule.parse(self.rule_string)
+        line = 're:classtype:trojan-activity "(alert)(.*)(from_server)(.*)" "drop\\2to_client\\4"'
+        filter = rulecat.ModifyRuleFilter.parse(line)
+        self.assertTrue(filter != None)
+        self.assertTrue(filter.match(rule0))
+        rule1 = filter.filter(rule0)
+        expected = """drop http $EXTERNAL_NET any -> $HOME_NET any (msg:"ET MALWARE Windows executable sent when remote host claims to send an image 2"; flow: established,to_client; content:"|0d 0a|Content-Type|3a| image/jpeg|0d 0a 0d 0a|MZ"; fast_pattern:12,20; classtype:trojan-activity; sid:2020757; rev:2;)"""
+        self.assertEqual(str(rule1), expected)
 
 class GroupMatcherTestCase(unittest.TestCase):
 

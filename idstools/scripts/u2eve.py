@@ -23,7 +23,8 @@
 # IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-"""Read unified2 log files and output events as Suricata EVE JSON."""
+"""Read unified2 log files and output events as Suricata EVE JSON (or
+as close as possible)."""
 
 from __future__ import print_function
 
@@ -54,6 +55,7 @@ except ImportError as err:
 
 from idstools import unified2
 from idstools import maps
+from idstools import util
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 LOG = logging.getLogger()
@@ -84,32 +86,39 @@ def calculate_flow_id(event):
     flow_id = event["protocol"] << 24
 
     if len(event["source-ip.raw"]) == 4:
-        flow_id = flow_id ^ \
-           struct.unpack(">L", event["source-ip.raw"])[0] ^ \
+        flow_id += struct.unpack(">L", event["source-ip.raw"])[0] + \
            struct.unpack(">L", event["destination-ip.raw"])[0]
     else:
         for part in struct.unpack(">LLLL", event["source-ip.raw"]):
-            flow_id = flow_id ^ part
+            flow_id += part
         for part in struct.unpack(">LLLL", event["destination-ip.raw"]):
-            flow_id = flow_id ^ part
+            flow_id += part
 
-    if "src_port" in event and "dest_port" in event:
-        flow_id = flow_id ^ event["src_port"] ^ event["dest_port"]
+    if "sport-itype" in event and "dport-icode" in event:
+        flow_id += event["sport-itype"] + event["dport-icode"]
 
     return flow_id
 
 class EveFilter(object):
 
     def __init__(
-            self, msgmap=None, classmap=None):
+            self, msgmap=None, classmap=None, packet_printable=False,
+            packet_hex=False):
         self.msgmap = msgmap
         self.classmap = classmap
+        self.packet_printable = packet_printable
+        self.packet_hex = packet_hex
 
-    def filter(self, event):
+    def format_event(self, event):
         output = OrderedDict()
         output["timestamp"] = render_timestamp(
             event["event-second"], event["event-microsecond"])
         output["sensor_id"] = event["sensor-id"]
+
+        # These are Snort only.
+        output["event_id"] = event["event-id"]
+        output["event_second"] = event["event-second"]
+
         output["event_type"] = "alert"
         output["src_ip"] = event["source-ip"]
         if event["protocol"] in [socket.IPPROTO_UDP, socket.IPPROTO_TCP]:
@@ -136,11 +145,59 @@ class EveFilter(object):
         output["alert"] = alert
 
         # EVE only includes one packet.
-        if event["packets"]:
-            output["packet"] = base64.b64encode(
-                event["packets"][0]["data"]).decode("utf-8")
+        if event["packet"]:
+            packet = event["packet"]
+            output["packet"] = base64.b64encode(packet["data"]).decode("utf-8")
+            if self.packet_printable:
+                output["packet_printable"] = util.format_printable(
+                    packet["data"])
+            if self.packet_hex:
+                output["packet_hex"] = self.format_hex(packet["data"])
+            output["packet_info"] = {
+                "linktype": packet["linktype"],
+            }
+
+        if event["extra-data"]:
+            output["snort_extra_data"] = []
+            for ed in event["extra-data"]:
+                if ed["event-type"] in unified2.EXTRA_DATA_TYPE_MAP:
+                    name = unified2.EXTRA_DATA_TYPE_MAP[ed["event-type"]]
+                else:
+                    name = "unknown"
+                output["snort_extra_data"].append(OrderedDict(
+                    [("type", name.lower()),
+                     ("type_id", ed["event-type"]),
+                     ("data_printable", util.format_printable(ed["data"]),
+                    )]))
 
         return output
+
+    def format_packet(self, packet):
+        output = OrderedDict()
+        output["timestamp"] = render_timestamp(
+            packet["packet-second"], packet["packet-microsecond"])
+        output["sensor_id"] = packet["sensor-id"]
+
+        # Snort only values, but needed to correlate the packet with
+        # the event.
+        output["event_id"] = packet["event-id"]
+        output["event_second"] = packet["event-second"]
+
+        output["packet"] = base64.b64encode(packet["data"]).decode("utf-8")
+        if self.packet_printable:
+            output["packet_printable"] = util.format_printable(packet["data"])
+        if self.packet_hex:
+            output["packet_hex"] = self.format_hex(packet["data"])
+        output["packet_info"] = {
+            "linktype": packet["linktype"],
+        }
+        return output
+
+    def filter(self, event):
+        if isinstance(event, unified2.Event):
+            return self.format_event(event)
+        elif isinstance(event, unified2.Packet):
+            return self.format_packet(event)
 
     def resolve_classification(self, event, default=None):
         if self.classmap:
@@ -160,6 +217,13 @@ class EveFilter(object):
     def getprotobynumber(self, protocol):
         return proto_map.get(protocol, str(protocol))
 
+    def format_hex(self, data):
+        if sys.version_info.major < 3:
+            hexbytes = ["%02x" % ord(byte) for byte in data]
+        else:
+            hexbytes = ["%02x" % byte for byte in data]
+        return " ".join(hexbytes)
+
 class OutputWrapper(object):
 
     def __init__(self, filename, fileobj=None):
@@ -167,15 +231,17 @@ class OutputWrapper(object):
         self.fileobj = fileobj
 
         if self.fileobj is None:
-            self.reopen()
             self.isfile = True
+            self.reopen()
         else:
             self.isfile = False
 
     def reopen(self):
+        if not self.isfile:
+            return
         if self.fileobj:
             self.fileobj.close()
-        self.fileobj = open(self.filename, "ab")
+        self.fileobj = open(self.filename, "a")
 
     def write(self, buf):
         if self.isfile:
@@ -207,6 +273,31 @@ epilog = """If --directory and --prefix are provided files will be
 read from the specified 'spool' directory.  Otherwise files on the
 command line will be processed.
 """
+
+class Writer:
+
+    def __init__(self, outputs, formatter):
+        self.outputs = outputs
+        self.formatter = formatter
+
+    def write(self, event):
+        encoded = json.dumps(self.formatter.filter(event))
+        for output in self.outputs:
+            output.write(encoded)
+
+class RolloverHandler(object):
+
+    def __init__(self, delete):
+        self.delete = delete
+
+    def on_rollover(self, closed, opened):
+        if closed:
+            LOG.info("Closed file %s, opened %s", closed, opened)
+            if self.delete:
+                LOG.info("Deleting %s", closed)
+                os.unlink(closed)
+        elif opened:
+            LOG.info("Opened file %s", opened)
 
 def main():
 
@@ -244,11 +335,17 @@ def main():
         "--delete", action="store_true", default=False,
         help="delete spool files")
     parser.add_argument(
-        "--output", metavar="<filename>",
+        "-o", "--output", metavar="<filename>",
         help="output filename (eg: /var/log/snort/alerts.json")
     parser.add_argument(
         "--stdout", action="store_true", default=False,
         help="also log to stdout if --output is a file")
+    parser.add_argument(
+        "--packet-printable", action="store_true", default=False,
+        help="add packet_printable field to events")
+    parser.add_argument(
+        "--packet-hex", action="store_true", default=False,
+        help="add packet_hex field to events")
     parser.add_argument(
         "filenames", nargs="*")
     args = parser.parse_args()
@@ -274,7 +371,9 @@ def main():
     else:
         LOG.info("Loaded %s classifications.", classmap.size())
 
-    eve_filter = EveFilter(msgmap, classmap)
+    eve_filter = EveFilter(
+        msgmap, classmap, packet_printable=args.packet_printable,
+        packet_hex=args.packet_hex)
 
     outputs = []
 
@@ -285,27 +384,63 @@ def main():
     else:
         outputs.append(OutputWrapper("-", sys.stdout))
 
+    writer = Writer(outputs, eve_filter)
+
+    bookmark = None
+
     if args.directory and args.prefix:
-        reader = unified2.SpoolEventReader(
+        init_filename, init_offset = None, None
+        if args.bookmark:
+            bookmark = unified2.Unified2Bookmark(
+                args.directory, args.prefix)
+            init_filename, init_offset = bookmark.get()
+        rollover_handler = RolloverHandler(args.delete)
+        reader = unified2.SpoolRecordReader(
             directory=args.directory,
             prefix=args.prefix,
             follow=args.follow,
-            delete=args.delete,
-            bookmark=args.bookmark)
+            init_filename=init_filename,
+            init_offset=init_offset,
+            rollover_hook=rollover_handler.on_rollover)
     elif args.filenames:
-        reader = unified2.FileEventReader(*args.filenames)
+        if args.bookmark:
+            LOG.error("Bookmarking not supported in file mode, exiting.")
+            return 1
+        reader = unified2.FileRecordReader(*args.filenames)
     else:
         print("nothing to do.")
         return
 
-    for event in reader:
-        try:
-            encoded = json.dumps(eve_filter.filter(event))
-            for out in outputs:
-                out.write(encoded)
-        except Exception as err:
-            LOG.error("Failed to encode record as JSON: %s: %s" % (
-                str(err), str(event)))
+    event = None
+    for record in reader:
+        if isinstance(record, unified2.Event):
+            if event is not None:
+                writer.write(event)
+                if args.bookmark and bookmark:
+                    location = reader.tell()
+                    bookmark.update(*location)
+            event = record
+        elif isinstance(record, unified2.ExtraData):
+            if not event:
+                continue
+            event["extra-data"].append(record)
+        elif isinstance(record, unified2.Packet):
+            if event and "packet" in event:
+                writer.write(event)
+                if args.bookmark and bookmark:
+                    location = reader.tell()
+                    bookmark.update(*location)
+                event = None
+            if event is None:
+                # Write packet...
+                writer.write(record)
+                if args.bookmark and bookmark:
+                    location = reader.tell()
+                    bookmark.update(*location)
+            else:
+                event["packet"] = record
+    if event:
+        writer.write(event)
 
 if __name__ == "__main__":
     sys.exit(main())

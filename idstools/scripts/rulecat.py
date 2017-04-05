@@ -1,4 +1,4 @@
-# Copyright (c) 2015 Jason Ish
+# Copyright (c) 2015-2017 Jason Ish
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -40,6 +40,7 @@ import shutil
 
 try:
     from io import BytesIO
+    from io import StringIO
 except:
     from StringIO import StringIO as BytesIO
 
@@ -88,14 +89,15 @@ class IdRuleMatcher(object):
         return self.generatorId == rule.gid and self.signatureId == rule.sid
 
     @classmethod
-    def parse(cls, match):
+    def parse(cls, buf):
+        logger.debug("Parsing ID matcher: %s" % (buf))
         try:
-            signatureId = int(match)
+            signatureId = int(buf)
             return cls(1, signatureId)
         except:
             pass
         try:
-            generatorString, signatureString = match.split(":")
+            generatorString, signatureString = buf.split(":")
             generatorId = int(generatorString)
             signatureId = int(signatureString)
             return cls(generatorId, signatureId)
@@ -116,10 +118,11 @@ class GroupMatcher(object):
         return False
 
     @classmethod
-    def parse(cls, match):
-        if match.startswith("group:"):
+    def parse(cls, buf):
+        if buf.startswith("group:"):
             try:
-                group = match.split(":", 1)[1]
+                logger.debug("Parsing group matcher: %s" % (buf))
+                group = buf.split(":", 1)[1]
                 return cls(group.strip())
             except:
                 pass
@@ -141,9 +144,8 @@ class ReRuleMatcher(object):
     def parse(cls, buf):
         if buf.startswith("re:"):
             try:
+                logger.debug("Parsing regex matcher: %s" % (buf))
                 patternstr = buf.split(":", 1)[1].strip()
-                logger.debug(
-                    "Compiling regular expression match: %s" % (patternstr))
                 pattern = re.compile(patternstr, re.I)
                 return cls(pattern)
             except:
@@ -210,14 +212,15 @@ class Fetch(object):
     def check_checksum(self, tmp_filename, url):
         try:
             checksum_url = url + ".md5"
-            local_checksum = hashlib.md5(open(tmp_filename).read()).hexdigest()
+            local_checksum = hashlib.md5(
+                open(tmp_filename, "rb").read()).hexdigest().strip()
             remote_checksum_buf = BytesIO()
             logger.info("Checking %s." % (checksum_url))
-            remote_checksum = idstools.net.get(
-                checksum_url, remote_checksum_buf)
+            idstools.net.get(checksum_url, remote_checksum_buf)
+            remote_checksum = remote_checksum_buf.getvalue().decode().strip()
             logger.debug("Local checksum=|%s|; remote checksum=|%s|" % (
-                local_checksum.strip(), remote_checksum_buf.getvalue().strip()))
-            if local_checksum.strip() == remote_checksum_buf.getvalue().strip():
+                local_checksum, remote_checksum))
+            if local_checksum == remote_checksum:
                 os.utime(tmp_filename, None)
                 return True
         except Exception as err:
@@ -225,15 +228,19 @@ class Fetch(object):
         return False
 
     def progress_hook(self, content_length, bytes_read):
-        percent = int((bytes_read / float(content_length)) * 100)
+        if not content_length or content_length == 0:
+            percent = 0
+        else:
+            percent = int((bytes_read / float(content_length)) * 100)
         buf = " %3d%% - %-30s" % (
             percent, "%d/%d" % (bytes_read, content_length))
         sys.stdout.write(buf)
         sys.stdout.flush()
         sys.stdout.write("\b" * 38)
-        if bytes_read and bytes_read >= content_length:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+
+    def progress_hook_finish(self):
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
     def basename(self, url):
         """ Return the base filename of the URL. """
@@ -245,7 +252,8 @@ class Fetch(object):
         if not self.args.force and os.path.exists(tmp_filename):
             if time.time() - os.stat(tmp_filename).st_mtime < (60 * 15):
                 logger.info(
-                    "Last download less than 15 minutes ago. Not fetching.")
+                    "Last download less than 15 minutes ago. Not downloading %s.",
+                    url)
                 return self.extract_files(tmp_filename)
             if self.check_checksum(tmp_filename, url):
                 logger.info("Remote checksum has not changed. Not fetching.")
@@ -255,6 +263,7 @@ class Fetch(object):
         logger.info("Fetching %s." % (url))
         idstools.net.get(
             url, open(tmp_filename, "wb"), progress_hook=self.progress_hook)
+        self.progress_hook_finish()
         logger.info("Done.")
         return self.extract_files(tmp_filename)
 
@@ -329,19 +338,16 @@ def load_matchers(filename):
 
     return matchers
 
-def load_local_files(local, files):
+def load_local(local, files):
     """Load local files into the files dict."""
     if os.path.isdir(local):
         for dirpath, dirnames, filenames in os.walk(local):
             for filename in filenames:
                 if filename.endswith(".rules"):
                     path = os.path.join(local, filename)
-                    if filename in files:
-                        logger.warn(
-                            "Local file %s overrides existing file of "
-                            "same name." % (path))
-                    files[filename] = open(path).read()
+                    load_local(path, files)
     else:
+        logger.info("Loading local file %s" % (local))
         filename = os.path.basename(local)
         if filename in files:
             logger.warn(
@@ -590,6 +596,12 @@ def resolve_etopen_url(suricata_version):
 
     return ET_OPEN_URL % mappings
 
+def ignore_file(ignore_files, filename):
+    for name in ignore_files:
+        if name == filename:
+            return True
+    return False
+
 def main():
 
     conf_filenames = [arg for arg in sys.argv if arg.startswith("@")]
@@ -610,6 +622,8 @@ def main():
                         metavar="<path>",
                         help="Path to Suricata program (default: %s)" %
                         suricata_path)
+    parser.add_argument("--suricata-version", metavar="<version>",
+                        help="Override Suricata version")
     parser.add_argument("-f", "--force", action="store_true", default=False,
                         help="Force operations that might otherwise be skipped")
     parser.add_argument("--rules-dir", metavar="<directory>",
@@ -623,7 +637,8 @@ def main():
     parser.add_argument("--url", metavar="<url>", action="append",
                         default=[],
                         help="URL to use instead of auto-generating one")
-    parser.add_argument("--local", metavar="<filename>",
+    parser.add_argument("--local", metavar="<filename>", action="append",
+                        default=[],
                         help="Local rule files or directories")
     parser.add_argument("--sid-msg-map", metavar="<filename>",
                         help="Generate a sid-msg.map file")
@@ -638,6 +653,10 @@ def main():
                         help="Filename of rule modification configuration")
     parser.add_argument("--drop", metavar="<filename>",
                         help="Filename of drop rules configuration")
+
+    parser.add_argument("--ignore", metavar="<filename>", action="append",
+                        default=[],
+                        help="Filenames to ignore")
 
     parser.add_argument("--threshold-in", metavar="<filename>",
                         help="Filename of rule thresholding configuration")
@@ -657,8 +676,14 @@ def main():
                         help="Command to run after update if modified")
     parser.add_argument("-T", "--test-command", metavar="<command>",
                         help="Command to test Suricata configuration")
+    parser.add_argument("-V", "--version", action="store_true", default=False,
+                        help="Display version")
 
     args = parser.parse_args()
+
+    if args.version:
+        print("idstools-rulecat version %s" % idstools.version)
+        return 0
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -668,10 +693,21 @@ def main():
     if args.dump_sample_configs:
         return dump_sample_configs()
 
-    if args.suricata and os.path.exists(args.suricata):
+    if args.suricata_version:
+        suricata_version = idstools.suricata.parse_version(args.suricata_version)
+        if not suricata_version:
+            logger.error("Failed to parse provided Suricata version: %s" % (
+                suricata_version))
+            return 1
+        logger.info("Forcing Suricata version to %s." % (suricata_version.full))
+    elif args.suricata and os.path.exists(args.suricata):
         suricata_version = idstools.suricata.get_version(args.suricata)
-        logger.info("Found Suricata version %s at %s." % (
-            str(suricata_version.full), args.suricata))
+        if suricata_version:
+            logger.info("Found Suricata version %s at %s." % (
+                str(suricata_version.full), args.suricata))
+        else:
+            logger.warn("Failed to get Suricata version.")
+            suricata_version = None
     else:
         suricata_version = None
 
@@ -699,11 +735,16 @@ def main():
 
     files = Fetch(args).run()
 
-    if args.local:
-        load_local_files(args.local, files)
+    for path in args.local:
+        load_local(path, files)
 
     rules = []
     for filename in files:
+        if not filename.endswith(".rules"):
+            continue
+        if ignore_file(args.ignore, filename):
+            logger.info("Ignoring file %s" % (filename))
+            continue
         logger.debug("Parsing %s." % (filename))
         rules += idstools.rule.parse_fileobj(
             BytesIO(files[filename]), filename)
